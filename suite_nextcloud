@@ -1,0 +1,201 @@
+#!/bin/bash
+#########################################################
+# Script taken from https://riegers.in/install-nextcloud-18-using-one-script-only/
+# (c) Carsten Rieger IT-Services (Ubuntu 18.04) 26.01.2020
+# Donatationis are really appreciated
+# => https://paypal.me/carstenrieger
+#########################################################
+
+###global function to update and cleanup the environment
+function update_and_clean() {
+apt update
+apt upgrade -y
+apt autoclean -y
+apt autoremove -y
+}
+###global function to restart all cloud services
+function restart_all_services() {
+/usr/sbin/service nginx restart
+/usr/sbin/service mysql restart
+/usr/sbin/service redis-server restart
+/usr/sbin/service php7.3-fpm restart
+}
+###global function to scan Nextcloud data and generate an overview for fail2ban & ufw
+function nextcloud_scan_data() {
+sudo -u www-data php /var/www/nextcloud/occ files:scan --all
+sudo -u www-data php /var/www/nextcloud/occ files:scan-app-data
+fail2ban-client status nextcloud
+ufw status verbose
+}
+### START ###
+echo "++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++"
+echo "Nextcloud-Administrator and password - Attention: password is case-sensitive:"
+echo "++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++"
+echo ""
+export NEXTCLOUDSERVERNAME=154.127.82.66
+export NEXTCLOUDADMINUSER=nextcloud
+export NEXTCLOUDDATAPATH=/var/www/nextcloud/data
+#@KADER FIX HOSTNAME BY ASKING FOR SERVER NAME 
+
+###read and store the current hostname in lowercases
+declare -l YOURSERVERNAME
+#YOURSERVERNAME=$(hostname) 
+#@KADER FIX HOSTNAME
+YOURSERVERNAME=$NEXTCLOUDSERVERNAME
+###Modifications to Nextclouds config.php
+sudo -u www-data cp /var/www/nextcloud/config/config.php /var/www/nextcloud/config/config.php.bak
+sudo -u www-data php /var/www/nextcloud/occ config:system:set trusted_domains 0 --value=$YOURSERVERNAME
+sudo -u www-data php /var/www/nextcloud/occ config:system:set overwrite.cli.url --value=https://$YOURSERVERNAME
+echo ""
+echo "++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++"
+###backup of the effected file .user.ini
+cp /var/www/nextcloud/.user.ini /usr/local/src/.user.ini.bak
+###apply Nextcloud optimizations
+sudo -u www-data sed -i "s/output_buffering=.*/output_buffering='Off'/" /var/www/nextcloud/.user.ini
+sudo -u www-data php /var/www/nextcloud/occ background:cron
+###apply optimizations to Nextclouds global config.php
+sed -i '/);/d' /var/www/nextcloud/config/config.php
+cat <<EOF >>/var/www/nextcloud/config/config.php
+'activity_expire_days' => 14,
+'auth.bruteforce.protection.enabled' => true,
+'blacklisted_files' =>
+array (
+0 => '.htaccess',
+1 => 'Thumbs.db',
+2 => 'thumbs.db',
+),
+'cron_log' => true,
+'enable_previews' => true,
+'enabledPreviewProviders' =>
+array (
+0 => 'OC\\Preview\\PNG',
+1 => 'OC\\Preview\\JPEG',
+2 => 'OC\\Preview\\GIF',
+3 => 'OC\\Preview\\BMP',
+4 => 'OC\\Preview\\XBitmap',
+5 => 'OC\\Preview\\Movie',
+6 => 'OC\\Preview\\PDF',
+7 => 'OC\\Preview\\MP3',
+8 => 'OC\\Preview\\TXT',
+9 => 'OC\\Preview\\MarkDown',
+),
+'filesystem_check_changes' => 0,
+'filelocking.enabled' => 'true',
+'htaccess.RewriteBase' => '/',
+'integrity.check.disabled' => false,
+'knowledgebaseenabled' => false,
+'log_rotate_size' => 104857600,
+'logfile' => '$NEXTCLOUDDATAPATH/nextcloud.log',
+'logtimezone' => 'Europe/Paris',
+'memcache.local' => '\\OC\\Memcache\\APCu',
+'memcache.locking' => '\\OC\\Memcache\\Redis',
+'preview_max_x' => 1024,
+'preview_max_y' => 768,
+'preview_max_scale_factor' => 1,
+'redis' =>
+array (
+'host' => '/var/run/redis/redis-server.sock',
+'port' => 0,
+'timeout' => 0.0,
+),
+'quota_include_external_storage' => false,
+'share_folder' => '/Shares',
+'skeletondirectory' => '',
+'trashbin_retention_obligation' => 'auto, 7',
+);
+EOF
+sed -i "s/.*dbhost.*/\ \ 'dbhost\' \=\>\ \'localhost\:\/var\/run\/mysqld\/mysqld\.sock\'\,/g" /var/www/nextcloud/config/config.php
+###remove leading whitespaces
+sed -i 's/^[ ]*//' /var/www/nextcloud/config/config.php
+chown -R www-data:www-data /var/www
+restart_all_services
+update_and_clean
+###install fail2ban
+apt install fail2ban -y
+###create a fail2ban Nextcloud filter
+touch /etc/fail2ban/filter.d/nextcloud.conf
+cat <<EOF >/etc/fail2ban/filter.d/nextcloud.conf
+[Definition]
+failregex=^{"reqId":".*","remoteAddr":".*","app":"core","message":"Login failed: '.*' \(Remote IP: '<HOST>'\)","level":2,"time":".*"}$
+          ^{"reqId":".*","level":2,"time":".*","remoteAddr":".*","user,:".*","app":"no app in context".*","method":".*","message":"Login failed: '.*' \(Remote IP: '<HOST>'\)".*}$
+          ^{"reqId":".*","level":2,"time":".*","remoteAddr":".*","user":".*","app":".*","method":".*","url":".*","message":"Login failed: .* \(Remote IP: <HOST>\).*}$
+EOF
+###create a fail2ban Nextcloud jail
+touch /etc/fail2ban/jail.d/nextcloud.local
+cat <<EOF >/etc/fail2ban/jail.d/nextcloud.local
+[nextcloud]
+backend = auto
+enabled = true
+port = 80,443
+protocol = tcp
+filter = nextcloud
+maxretry = 5
+bantime = 3600
+findtime = 3600
+logpath = $NEXTCLOUDDATAPATH/nextcloud.log
+[nginx-http-auth]
+enabled = true
+EOF
+update_and_clean
+###install ufw
+apt install ufw -y
+###open firewall ports 80+443 for http(s)
+ufw allow 80/tcp
+ufw allow 443/tcp
+###open firewall port 22 for SSH
+ufw allow 22/tcp
+###enable UFW (autostart)
+ufw logging medium && ufw default deny incoming && ufw enable
+###restart fail2ban, ufw and redis-server services
+/usr/sbin/service ufw restart
+/usr/sbin/service fail2ban restart
+/usr/sbin/service redis-server restart
+sudo -u www-data php /var/www/nextcloud/occ app:disable survey_client
+sudo -u www-data php /var/www/nextcloud/occ app:disable firstrunwizard
+sudo -u www-data php /var/www/nextcloud/occ app:enable admin_audit
+sudo -u www-data php /var/www/nextcloud/occ app:enable files_pdfviewer
+###clean up redis-server
+redis-cli -s /var/run/redis/redis-server.sock <<EOF
+FLUSHALL
+quit
+EOF
+###Nextcloud occ db:... (maintenance/optimization)
+/usr/sbin/service nginx stop
+clear
+echo "---------------------------------"
+echo "Issue Nextcloud-DB optimizations!"
+echo "---------------------------------"
+echo "Press 'y' to issue optimizations."
+echo "---------------------------------"
+echo ""
+sudo -u www-data php /var/www/nextcloud/occ db:add-missing-indices
+sudo -u www-data php /var/www/nextcloud/occ db:convert-filecache-bigint
+###rescan Nextcloud data
+nextcloud_scan_data
+restart_all_services
+### issue the cron.php once
+sudo -u www-data php /var/www/nextcloud/cron.php
+clear
+echo ""
+echo "+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++"
+echo ""
+echo " Open your browser and call your Nextcloud at"
+echo ""
+echo " https://$YOURSERVERNAME"
+echo ""
+echo "*******************************************************************************"
+echo ""
+echo "+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++"
+echo ""
+echo " I do strongly recommend to enhance the server security by re-creating"
+echo " the dhparam.pem file:"
+echo ""
+echo " openssl dhparam -out /etc/ssl/certs/dhparam.pem 4096"
+echo ""
+echo " https://www.gredeir.de/nextcloud-installationsanleitung/#dhparamfile"
+echo ""
+echo "+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++"
+echo ""
+### CleanUp
+cat /dev/null > ~/.bash_history && history -c && history -w
+exit 0
